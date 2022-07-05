@@ -3,6 +3,8 @@
 ; 2020 R. Branten
 ; Written for use with the AtTiny26L-8pi
 ;
+; Clock set to 1Mhz internal clock
+
 .NOLIST
 .include "tn26def.inc"
 .LIST
@@ -20,7 +22,7 @@
 ; R17       | registerB             | General purpose
 ; R18       | delayRegisterA        | Delaying program execution
 ; R19       | delayRegisterB        | Delaying program execution
-; R20       | digit1                | Storing ones  of 7-segment
+; R20       | digit1                | Storing ones of 7-segment
 ; R21       | digit2                | Storing tens of 7-segment
 ; R22       | digit3                | Storing hundreds of 7-segment
 ; R23       | digit4                | Storing thousands of 7-segment
@@ -33,11 +35,9 @@
 .DEF arithmicRegisterB = R2
 .DEF arithmicRegisterC = R3
 .DEF arithmicRegisterD = R4
-.DEF incrementButtonStatus = R5
-.DEF decrementButtonStatus = R6
+.DEF buttonPushRegister = R18
 .DEF counterHigh = R25
 .DEF counterLow = R24
-.DEF delayRegisterA = R18
 .DEF delayRegisterB = R19
 
 ; Digit numbering
@@ -51,7 +51,6 @@
 .DEF digit2 = R21
 .DEF digit3 = R22
 .DEF digit4 = R23
-
 
 ;===============================================================================
 ; PINS
@@ -80,7 +79,6 @@
 .EQU display2 = PA1
 .EQU display3 = PA2
 .EQU display1 = PA3
-
 
 ;===============================================================================
 ; CONSTANTS
@@ -112,24 +110,23 @@
 ;
 .CSEG
 .ORG $0000
-    RJMP  init                                              ; Reset handler
-    RETI                                                    ; Dummy for unused interrupt
-    RJMP  buttonPress                                       ; Pin change handler
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-    RETI                                                    ; Dummy for unused interrupt
-
+    RJMP    RESET                                           ; Hardware Pin and Watchdog Reset
+    RETI                                                    ; External Interrupt Request 0
+    RJMP    PIN_CHANGE                                      ; Pin Change Interrupt
+    RETI                                                    ; Timer/Counter1 Compare Match 1A
+    RETI                                                    ; Timer/Counter1 Compare Match 1B
+    RETI                                                    ; Timer/Counter1 Overflow
+    RJMP    TIM0_OVF                                        ; Timer/Counter0 Overflow
+    RETI                                                    ; USI Start
+    RETI                                                    ; USI Overflow
+    RETI                                                    ; EEPROM Ready
+    RETI                                                    ; Analog Comparator
+    RETI                                                    ; ADC Conversion Complete
 
 ;===============================================================================
 ; SETUP
 ;
-init:
+RESET:
     CLI                                                     ; Disable interrupts
 
     LDI     registerA, RAMEND
@@ -489,46 +486,60 @@ delayStart:
     CP      delayRegisterA, delayRegisterB
     BRNE    delayStart
     RET
-    
+
+setTimer:
+    ; Use the 8-bit timer0
+    ; We want to wait about 10ms or 10000us
+    ; If we use a prescaler of 1024 we get about 9.77ms which is close enough
+    LDI     registerA, (1<<CS02)                        ; Clock select bit2
+    OR      registerA, (1<<CS00)                        ; Clock select bit0, registerA = (1<<CS02|1<<CS00)
+    OUT     TCCR0B, registerA                           ; Set prescaler to /1024
+    LDI     registerA, (1<<TOV0)                        ; Load timer overflow flag
+    OUT     TIFR0, registerA                            ; Reset by writing a 1
+    LDI     registerA, (1<<TOIE0)                       ; Load overflow interrupt flag for timer 0
+    STS     TIMSK0, registerA                           ; Enable overflow interrupt flag for timer 0
+    RET
 
 ;===============================================================================
 ; ISR SUBROUTINES
 ;
-buttonPress:
+PIN_CHANGE:
+    CLI                                                     ; Disable interrupt
     ; Push registers on stack
     PUSH    registerA
     PUSH    registerB
-    ; Check for increment button
-    IN      registerA, PINB                                 ; High pins on port A
-    LDI     registerB, (1<<incrementPin)
-    AND     registerA, registerB                            ; Keep only increment pin by using and
-    CP      registerA, registerB
-    BRNE    incrementNotPressed_2                           ; Increment button not pressed
-    ; Incement is pressed, store
-    LDI     registerA, 1
-    MOV     incrementButtonStatus, registerA
-    MOV     arithmicRegisterC, registerA
-    RJMP    endButtonPress
-incrementNotPressed_2:
-    LDI     registerA, 0
-    MOV     incrementButtonStatus, registerA
-    ; Check if decrement button is pressed
-    IN      registerA, PINB                                 ; High pins on port A
-    LDI     registerB, (1<<decrementPin)
-    AND     registerA, registerB                            ; Keep only decrement pin by using AND
-    CP      registerA, registerB
-    BRNE    decrementNotPressed
-    ; Decrement is pressed, store
-    LDI     registerA, 1
-    MOV     decrementButtonStatus, registerA
-    MOV     arithmicRegisterC, registerA
-    RJMP    endButtonPress
-decrementNotPressed:
-    LDI     registerA, 0
-    MOV     decrementButtonStatus, registerA
-endButtonPress:
+
+    RJMP    setTimer                                        ; (Re)set timer
+
     ; Pop registers from stack
     POP     registerB
     POP     registerA
+    SEI                                                     ; Enable interrupt
     RETI
 
+TIM0_OVF:
+    CLI                                                     ; Disable interrupt
+    ; Push registers on stack
+    PUSH    registerA
+    PUSH    registerB
+
+    ; Clear stop the timer by setting Clock select to 0
+    LDI     registerA, 0x000000
+    OUT     TCCR0B, registerA
+
+    ; The timer was started because of a button that was pressed
+    IN      registerA, PINB                                 ; Load port A
+    LDI     registerB, (1<<incrementPin)                    ; Set value for increment
+    CP      registerA, registerB                            ; Compare, only increment pin should remain
+    SBRS    SREG, 0x00000010                                ; Check if zero flag is set, if not skip next instruction
+    RJMP    incrementCounter
+    LDI     registerB, (1<<decrementPin)                    ; Set value for decrement
+    CP      registerA, registerB                            ; Compare, only decrement pin should remain
+    SBRS    SREG, 0x00000010                                ; Check if zero flag is set, if not skip next instruction
+    RJMP    decrementCounter
+
+    ; Pop registers from stack
+    POP     registerB
+    POP     registerA
+    SEI                                                     ; Enable interrupt
+    RETI
